@@ -10,26 +10,29 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Walks the AST and emits x86-64 NASM assembly for Windows.
+ * Walks the AST and emits x86-64 NASM assembly for the target platform.
  *
- * Calling convention (Windows x64 ABI):
- *   - First 4 integer/pointer args go in RCX, RDX, R8, R9.
- *   - The caller must reserve 32 bytes of "shadow space" below RSP before
- *     every CALL so the callee can home its register parameters there.
- *   - The 5th argument onward lives on the stack at [RSP+32], [RSP+40], …
- *   - RSP must be 16-byte aligned immediately before each CALL instruction.
+ * Win64 calling convention (Windows x64 ABI):
+ *   - First 4 args: RCX, RDX, R8, R9.
+ *   - Caller reserves 32 bytes of shadow space below RSP before every CALL.
+ *   - 5th arg onward at [RSP+32], [RSP+40], …
+ *
+ * Linux calling convention (System V AMD64 ABI):
+ *   - First 6 args: RDI, RSI, RDX, RCX, R8, R9.
+ *   - No shadow space.
+ *   - 7th arg onward at [RSP+0], [RSP+8], …
+ *
+ * RSP must be 16-byte aligned immediately before each CALL on both ABIs.
  *
  * Stack frame layout (after standard prologue):
  *
  *   [rbp + 8]     return address
  *   [rbp]         saved rbp
- *   [rbp - 8]     param 0  (spilled from RCX)
- *   [rbp - 16]    param 1  (spilled from RDX)
+ *   [rbp - 8]     param 0  (spilled from first arg register)
+ *   [rbp - 16]    param 1  (spilled from second arg register)
  *   …
  *   [rbp - N]     last local variable
- *   …
- *   [rsp + 32]    slot for 5th call argument
- *   [rsp + 0..28] shadow space for our callees (32 bytes)
+ *   …              shadow space (Win64 only, 32 bytes) + extra stack arg slots
  *
  * All variables (params and locals) are stored as 8-byte qwords, even chars.
  * When loading from a char* pointer via [] the byte is zero-extended to 64 bits.
@@ -44,6 +47,7 @@ public class CodeGen {
     // ── Whole-file state ──────────────────────────────────────────────────
 
     private final AST.TranslationUnit tu;
+    private final Platform platform;
 
     /** Names of functions defined in this TU — they don't need "extern". */
     private final Set<String> defined = new HashSet<String>();
@@ -68,18 +72,17 @@ public class CodeGen {
     /** Maps each variable name to its declared type (needed for byte vs qword loads). */
     private Map<String, AST.TypeSpec> varTypes;
 
-    /** Windows x64 register names for the first four arguments. */
-    private static final String[] ARG_REGS = { "rcx", "rdx", "r8", "r9" };
+    /** Argument registers in order for the target platform. */
+    private final String[] ARG_REGS;
 
     // ── Constructor ───────────────────────────────────────────────────────
 
-    public CodeGen(AST.TranslationUnit tu) {
-        this.tu = tu;
-        // Pre-build the set of locally defined functions so we know which
-        // called names need an "extern" declaration in the output.
+    public CodeGen(AST.TranslationUnit tu, Platform platform) {
+        this.tu       = tu;
+        this.platform = platform;
+        this.ARG_REGS = platform.argRegs();
         for (AST.FunctionDef f : tu.functions)
             if (f.body != null) defined.add(f.name);
-        // Global variable names are similarly pre-collected.
         for (AST.GlobalVarDecl g : tu.globals)
             globalVarNames.add(g.name);
     }
@@ -175,10 +178,10 @@ public class CodeGen {
         collectLocals(f.body, slot);
         int totalSlots = varOffsets.size();
 
-        // Frame size = space for all locals + 64 bytes at the bottom
-        // (32 shadow + 32 for up to 4 extra stack arguments).
+        // Frame size = locals + shadow space (Win64: 32, Linux: 0) + 32 for
+        // up to 4 extra stack arguments beyond the register arg count.
         // Must be a multiple of 16 to keep RSP aligned before CALL.
-        int frameSize = roundUp16(totalSlots * 8 + 64);
+        int frameSize = roundUp16(totalSlots * 8 + platform.shadowSpace() + 32);
 
         // --- Prologue ---
         out.append(f.name).append(":\n");
@@ -186,14 +189,13 @@ public class CodeGen {
         out.append("    mov     rbp, rsp\n");
         out.append("    sub     rsp, ").append(frameSize).append("\n\n");
 
-        // Spill register parameters into their frame slots
-        String[] paramRegs = { "rcx", "rdx", "r8", "r9" };
+        // Spill incoming register parameters into their frame slots
         int regIdx = 0;
         for (AST.ParamDecl p : f.params) {
-            if (p.varargs || p.name == null || regIdx >= 4) { regIdx++; continue; }
+            if (p.varargs || p.name == null || regIdx >= ARG_REGS.length) { regIdx++; continue; }
             int off = varOffsets.get(p.name);
             out.append("    mov     [rbp").append(off).append("], ")
-               .append(paramRegs[regIdx]).append('\n');
+               .append(ARG_REGS[regIdx]).append('\n');
             regIdx++;
         }
         if (!f.params.isEmpty()) out.append('\n');
@@ -528,8 +530,10 @@ public class CodeGen {
             if (i < ARG_REGS.length) {
                 loadArgIntoReg(arg, ARG_REGS[i], out);
             } else {
-                // 5th argument and beyond: write to [rsp + 32 + (i-4)*8]
-                int stackOff = 32 + (i - 4) * 8;
+                // Args beyond the register count go on the stack.
+                // Win64: [rsp + 32 + (i-4)*8]  (after the 32-byte shadow space)
+                // Linux: [rsp + 0  + (i-6)*8]  (no shadow space)
+                int stackOff = platform.shadowSpace() + (i - ARG_REGS.length) * 8;
                 genExpr(arg, out);  // value → RAX
                 out.append("    mov     qword [rsp+").append(stackOff)
                    .append("], rax\n");

@@ -1,4 +1,4 @@
-To compile a C file
+To compile a C file...
 
 jcc.bat "C:\Users\nick2\Code\HelloWorld\HelloWorld.c"
 
@@ -6,9 +6,12 @@ jcc.bat "C:\Users\nick2\Code\HelloWorld\HelloWorld.c"
 
   jcc.bat "C:\Users\nick2\Code\HelloWorld\HelloWorld.c" -o "C:\Users\nick2\Code\HelloWorld\HelloWorld.exe"
 
-To check into Git
+To check into Git...
 
 git add .
 git commit -m "Describe your changes"
 git push
 git tag -a v3.0 -m "Release Version 3.0"
+
+Check Tags...
+git tag
