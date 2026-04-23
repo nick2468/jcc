@@ -1,6 +1,9 @@
 # Ignore compiled Java class files
 *.class
 
+# Ignore compiled C files
+*.obj
+
 # Ignore the entire output folder
 out/
 
