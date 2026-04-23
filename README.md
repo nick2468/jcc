@@ -1,12 +1,12 @@
-# jcc — Java C Compiler, version 2
+# jcc — Java C Compiler, version 3
 
 A minimal K&R C compiler written in Java 1.8, targeting 64-bit Windows.  
-Compiles a small but growing subset of C to native x86-64 executables.
+Compiles a growing subset of C to native x86-64 executables.
 
-**What changed from v1:** `printf`, `puts`, and `putchar` are now implemented
-natively in `stdlib/src/stdio.c` using the Windows `kernel32.dll` API
-(`GetStdHandle` + `WriteFile`) instead of being resolved from the Windows
-UCRT (`ucrt.dll`).
+**v3 milestone — self-hosted stdlib:**  `stdlib/src/stdio.c` is now compiled
+by jcc itself rather than by gcc.  The compiler can handle everything its own
+standard library is written in: local variables, `if`/`while`, arithmetic,
+comparisons, pointers, and array indexing.
 
 ---
 
@@ -16,7 +16,7 @@ UCRT (`ucrt.dll`).
 |------|----------|---------|
 | JDK 1.8 | on `PATH` | compile and run jcc itself |
 | NASM | `C:\Apps\mingw64\bin\nasm.exe` | assemble generated `.asm` |
-| GCC (mingw64) | `C:\Apps\mingw64\bin\gcc.exe` | compile stdlib + link |
+| GCC (mingw64) | `C:\Apps\mingw64\bin\gcc.exe` | link only (no longer used to compile C) |
 
 Add `C:\Apps\mingw64\bin` to your system `PATH` so these tools are reachable from any terminal.
 
@@ -41,7 +41,8 @@ To specify an output name:
 jcc.bat hello.c -o myapp.exe
 ```
 
-The first compile also bootstraps `stdlib/src/stdio.obj` automatically.
+The first run also compiles `stdlib/src/stdio.c` using jcc itself (cached as
+`stdio.obj`; rebuilt only when `stdio.c` is newer).
 
 ---
 
@@ -63,14 +64,15 @@ hello.c
   ▼  CodeGen.java
   │  • Walks AST → x86-64 NASM assembly
   │  • Windows x64 ABI: args in RCX/RDX/R8/R9, 32-byte shadow space
+  │  • Two-pass: pre-scans locals for frame layout, then emits code
   │
   ▼  nasm.exe -f win64
   │  hello.asm → hello.obj
   │
-  ▼  gcc.exe -c  (bootstrap, runs once / when stdio.c changes)
-  │  stdlib/src/stdio.c → stdlib/src/stdio.obj
+  ▼  jcc itself (same pipeline, runs once / when stdio.c changes)
+  │  stdlib/src/stdio.c → stdlib/src/stdio.obj   ← SELF-HOSTED
   │
-  ▼  gcc.exe (linker only)
+  ▼  gcc.exe (linker only — no longer compiles any C)
      hello.obj + stdio.obj → hello.exe
      GNU ld resolves 'printf' from stdio.obj (strong symbol) before
      it reaches the ucrt import library — UCRT's printf is never used
@@ -80,39 +82,18 @@ hello.c
 
 ## Native stdio implementation
 
-`stdlib/src/stdio.c` is compiled with gcc (as a one-time bootstrap step) and
-linked with every program jcc produces.  It depends only on `kernel32.dll`:
+`stdlib/src/stdio.c` is written using only the C features jcc v3 can compile,
+and jcc compiles it itself on first use.  It depends only on `kernel32.dll`:
 
 ```
-GetStdHandle(STD_OUTPUT_HANDLE)   →  obtain stdout handle (cached)
-WriteFile(handle, buf, len, ...)  →  all output goes through this
+GetStdHandle(-11)               →  obtain stdout HANDLE (cached in _stdout)
+WriteFile(handle, &byte, 1, …)  →  all output goes through this
 ```
 
-### Supported printf format specifiers
-
-| Specifier | Meaning |
-|-----------|---------|
-| `%%` | literal `%` |
-| `%c` | `char` (promoted `int`) |
-| `%s` | `const char *` (prints `(null)` for NULL) |
-| `%d` / `%i` | signed `int`, decimal |
-| `%u` | unsigned `int`, decimal |
-| `%x` / `%X` | unsigned `int`, hex lower/upper |
-| `%p` | pointer, hex lowercase |
-
-Future specifiers (`%ld`, `%lld`, `%f`, field widths, precision) are added as
-the compiler and stdlib grow.
-
-### Roadmap to self-hosting stdio
-
-The long-term goal is for jcc to compile `stdio.c` itself, removing the gcc
-bootstrap step entirely.  That requires jcc to support:
-
-1. Local variables and stack allocation
-2. Pointer arithmetic and dereference
-3. `va_list` / `va_arg` (or a Windows x64 ABI-specific equivalent)
-4. Conditional statements and loops
-5. Static variables
+In v3, `printf` outputs its format string character by character with no
+format-specifier expansion.  `"Hello, World!\n"` is sufficient for most
+introductory programs; `%d`, `%s` etc. are a future addition once jcc
+supports `va_list` or the equivalent.
 
 ---
 
@@ -121,22 +102,30 @@ bootstrap step entirely.  That requires jcc to support:
 **Types**
 - `int`, `char`, `void`
 - Pointer types (`char *`, `int *`, etc.)
-- `const`, `unsigned`, `signed` qualifiers (parsed and ignored)
+- `const`, `unsigned`, `signed`, `static`, `extern`, `long` qualifiers (parsed and silently ignored)
 
 **Declarations**
-- Function definitions: `int foo(int x) { ... }`
-- Function forward declarations: `int printf(const char *fmt, ...);`
-- Variadic parameter lists (`...`)
+- Global variable declarations: `char *_stdout;`
+- Function definitions with typed parameters
+- Function forward declarations (including `...`)
+- Local variable declarations inside function bodies
 
 **Statements**
 - Expression statements: `foo();`
+- Assignment: `x = expr;`
 - `return expr;` and bare `return;`
-- Compound statements: `{ ... }`
+- `if (cond) stmt` and `if (cond) stmt else stmt`
+- `while (cond) stmt`
+- Compound (block) statements: `{ ... }`
 
 **Expressions**
-- Function calls: `printf("hello")`
+- Arithmetic: `+`  `-`  `*`  `/`  `%`
+- Comparisons: `==`  `!=`  `<`  `>`  `<=`  `>=`
+- Unary: `-` (negate)  `!` (logical not)  `&` (address-of)  `*` (dereference)
+- Array subscript: `a[i]`
+- Function calls (up to 5 arguments, matching the Windows x64 ABI)
 - String literals (with `\n \t \r \\ \" \0` escapes)
-- Integer literals
+- Integer literals (including negative via unary `-`)
 - Identifier references
 
 **Preprocessor**
@@ -148,49 +137,52 @@ bootstrap step entirely.  That requires jcc to support:
 ## Project structure
 
 ```
-jcc_v2/
+jcc/
   build.bat                   compile Java sources → out/
   jcc.bat                     run the compiler
   src/com/jcc/
-    Main.java                 entry point; orchestrates all stages + stdlib bootstrap
+    Main.java                 entry point; orchestrates all stages
     Preprocessor.java         #include expansion and directive stripping
     Lexer.java                character stream → token stream
     Token.java                token value + source line
     TokenType.java            token type enum
     Parser.java               recursive-descent parser → AST
-    CodeGen.java              AST → x86-64 NASM assembly
+    CodeGen.java              AST → x86-64 NASM assembly (two-pass, frame manager)
     ast/
       AST.java                all AST node types (inner static classes)
   stdlib/
     include/stdio.h           C header declaring printf, puts, putchar
-    src/stdio.c               native printf/puts/putchar (kernel32 only)
-    src/stdio.obj             compiled stdlib object (generated on first run)
+    src/stdio.c               native printf/puts/putchar (kernel32 only, jcc-compiled)
+    src/stdio.obj             compiled stdlib object (generated on first run by jcc)
   out/                        compiled .class files (generated by build.bat)
 ```
 
 ---
 
-## What changed from v1
+## What changed from v2
 
-| | v1 | v2 |
+| | v2 | v3 |
 |--|----|----|
-| `printf` source | `ucrt.dll` (Windows CRT) | `stdlib/src/stdio.c` (kernel32 only) |
-| `puts` / `putchar` | `ucrt.dll` | `stdlib/src/stdio.c` |
-| Link step | `gcc user.obj` | `gcc user.obj stdio.obj` |
-| `stdio.c` | comment / plan only | full implementation |
-| `Main.java` | link single obj | compile stdio.c if stale, then link both |
-| DLL imports | `printf` from ucrt | `GetStdHandle`, `WriteFile` from kernel32 |
+| stdio.c compiler | gcc (bootstrap) | **jcc itself (self-hosted)** |
+| printf | full format specifiers (%d %s %x …) | literal string output only |
+| Local variables | not supported | full stack allocation |
+| Arithmetic | not supported | `+ - * / %` |
+| Comparisons | not supported | `== != < > <= >=` |
+| Control flow | not supported | `if / else` and `while` |
+| Global variables | not supported | `.bss` section |
+| Unary operators | not supported | `- ! & *` |
+| Array indexing | not supported | `a[i]` (byte load, zero-extended) |
+| CodeGen | single-pass, no frame | two-pass: pre-scan locals, then emit |
+| Function args | up to 4 (registers only) | up to 5 (4 registers + stack slot) |
 
 ---
 
 ## Known limitations
 
-- No local variables or stack allocation
-- No arithmetic or comparison operators
-- No control flow (`if`, `while`, `for`)
-- No struct, union, or typedef
-- Only up to 4 function arguments (register args only; no stack spill)
+- No `struct`, `union`, or `typedef`
 - No `#define` or macro expansion
 - Single translation unit only (no multi-file compilation)
-- `printf` bootstrap compilation uses gcc; self-hosted stdlib compilation is
-  a future milestone
+- `printf` does not expand `%d`, `%s` etc. (format string printed literally)
+- No `for` loop (use `while`)
+- Assignment only to plain identifiers (no `*p = x` or `a[i] = x`)
+- Array indexing always loads one byte (correct for `char *`; not yet for `int *`)

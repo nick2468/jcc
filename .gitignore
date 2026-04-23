@@ -3,6 +3,7 @@
 
 # Ignore compiled C files
 *.obj
+*.asm
 
 # Ignore the entire output folder
 out/

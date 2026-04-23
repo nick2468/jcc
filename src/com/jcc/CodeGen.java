@@ -2,36 +2,103 @@ package com.jcc;
 
 import com.jcc.ast.AST;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * Generates x86-64 NASM assembly (Windows calling convention).
+ * Walks the AST and emits x86-64 NASM assembly for Windows.
  *
- * Windows x64 ABI rules applied:
- *   - First 4 integer/pointer args: RCX, RDX, R8, R9
- *   - 32 bytes of shadow space always allocated by the caller
- *   - Stack 16-byte aligned before each CALL
+ * Calling convention (Windows x64 ABI):
+ *   - First 4 integer/pointer args go in RCX, RDX, R8, R9.
+ *   - The caller must reserve 32 bytes of "shadow space" below RSP before
+ *     every CALL so the callee can home its register parameters there.
+ *   - The 5th argument onward lives on the stack at [RSP+32], [RSP+40], …
+ *   - RSP must be 16-byte aligned immediately before each CALL instruction.
+ *
+ * Stack frame layout (after standard prologue):
+ *
+ *   [rbp + 8]     return address
+ *   [rbp]         saved rbp
+ *   [rbp - 8]     param 0  (spilled from RCX)
+ *   [rbp - 16]    param 1  (spilled from RDX)
+ *   …
+ *   [rbp - N]     last local variable
+ *   …
+ *   [rsp + 32]    slot for 5th call argument
+ *   [rsp + 0..28] shadow space for our callees (32 bytes)
+ *
+ * All variables (params and locals) are stored as 8-byte qwords, even chars.
+ * When loading from a char* pointer via [] the byte is zero-extended to 64 bits.
+ *
+ * Expression evaluation convention: every genExpr() call leaves its result
+ * in RAX.  For binary expressions the left sub-expression is pushed onto the
+ * real stack (PUSH RAX / POP RCX), so nested expressions are handled
+ * correctly as long as those pushes are always balanced before any CALL.
  */
 public class CodeGen {
 
-    private final AST.TranslationUnit tu;
-    private final Set<String> defined    = new HashSet<String>();
-    private final Set<String> externs    = new LinkedHashSet<String>();
-    private final List<String> strings   = new ArrayList<String>();
+    // ── Whole-file state ──────────────────────────────────────────────────
 
+    private final AST.TranslationUnit tu;
+
+    /** Names of functions defined in this TU — they don't need "extern". */
+    private final Set<String> defined = new HashSet<String>();
+
+    /** External symbols that must be declared with "extern" in the assembly. */
+    private final Set<String> externs = new LinkedHashSet<String>();
+
+    /** Interned string literal contents; index = label suffix _str0, _str1 … */
+    private final List<String> strings = new ArrayList<String>();
+
+    /** Names of global variables emitted in .bss. */
+    private final Set<String> globalVarNames = new LinkedHashSet<String>();
+
+    /** Counter for generating unique local labels inside functions (.if_0, .while_1 …). */
+    private int labelCount = 0;
+
+    // ── Per-function state (reset for each function) ──────────────────────
+
+    /** Maps each local/param name to its rbp offset (always negative, e.g. -8, -16 …). */
+    private Map<String, Integer> varOffsets;
+
+    /** Maps each variable name to its declared type (needed for byte vs qword loads). */
+    private Map<String, AST.TypeSpec> varTypes;
+
+    /** Windows x64 register names for the first four arguments. */
     private static final String[] ARG_REGS = { "rcx", "rdx", "r8", "r9" };
+
+    // ── Constructor ───────────────────────────────────────────────────────
 
     public CodeGen(AST.TranslationUnit tu) {
         this.tu = tu;
+        // Pre-build the set of locally defined functions so we know which
+        // called names need an "extern" declaration in the output.
         for (AST.FunctionDef f : tu.functions)
             if (f.body != null) defined.add(f.name);
+        // Global variable names are similarly pre-collected.
+        for (AST.GlobalVarDecl g : tu.globals)
+            globalVarNames.add(g.name);
     }
 
+    // ── Entry point ───────────────────────────────────────────────────────
+
+    /**
+     * Generate the complete NASM source for the translation unit.
+     *
+     * Order of sections:
+     *   1. Header (bits 64, default rel)
+     *   2. extern declarations for functions called but not defined here
+     *   3. .bss  — global variables (zero-initialised)
+     *   4. .data — string literals
+     *   5. .text — function code
+     */
     public String generate() {
-        // Generate function bodies first so externs/strings are collected.
+        // Generate all function bodies first so that externs/strings/globals
+        // are fully collected before we emit the section headers.
         StringBuilder bodies = new StringBuilder();
         for (AST.FunctionDef f : tu.functions)
             if (f.body != null) genFunction(f, bodies);
@@ -41,10 +108,20 @@ public class CodeGen {
         out.append("bits 64\n");
         out.append("default rel\n\n");
 
+        // extern declarations
         for (String ext : externs)
             out.append("extern ").append(ext).append('\n');
         if (!externs.isEmpty()) out.append('\n');
 
+        // .bss — global variables (one qword each, zero-initialised)
+        if (!tu.globals.isEmpty()) {
+            out.append("section .bss\n\n");
+            for (AST.GlobalVarDecl g : tu.globals)
+                out.append(g.name).append(":  resq  1\n");
+            out.append('\n');
+        }
+
+        // .data — string literals
         if (!strings.isEmpty()) {
             out.append("section .data\n\n");
             for (int i = 0; i < strings.size(); i++)
@@ -53,6 +130,7 @@ public class CodeGen {
             out.append('\n');
         }
 
+        // .text — function definitions
         out.append("section .text\n\n");
         for (AST.FunctionDef f : tu.functions)
             if (f.body != null) out.append("global ").append(f.name).append('\n');
@@ -62,99 +140,490 @@ public class CodeGen {
         return out.toString();
     }
 
-    // -------------------------------------------------------------------------
-    // Function
-    // -------------------------------------------------------------------------
+    // ── Function generation ───────────────────────────────────────────────
 
+    /**
+     * Emit the prologue, body, and epilogue for one function.
+     *
+     * The prologue:
+     *   - Saves RBP and sets up the frame pointer.
+     *   - Allocates stack space for shadow space, local variables, and up to
+     *     4 stack-passed arguments (beyond the 4 register arguments).
+     *   - Spills the incoming register parameters into the local frame so
+     *     they can be referenced uniformly by name.
+     *
+     * The epilogue is a single ".exit" local label; return statements jump to it.
+     */
     private void genFunction(AST.FunctionDef f, StringBuilder out) {
+        // Build the variable map for this function: assign each param and
+        // local variable a negative rbp offset (8 bytes per slot).
+        varOffsets = new HashMap<String, Integer>();
+        varTypes   = new HashMap<String, AST.TypeSpec>();
+
+        int slot = 1; // next offset = -8 * slot
+
+        // Parameters occupy the first slots (spilled from registers on entry)
+        for (AST.ParamDecl p : f.params) {
+            if (p.varargs || p.name == null) continue;
+            varOffsets.put(p.name, -8 * slot);
+            varTypes.put(p.name, p.type);
+            slot++;
+        }
+
+        // Local variable declarations: scan the body to find them all so
+        // we know the total frame size before emitting the prologue.
+        collectLocals(f.body, slot);
+        int totalSlots = varOffsets.size();
+
+        // Frame size = space for all locals + 64 bytes at the bottom
+        // (32 shadow + 32 for up to 4 extra stack arguments).
+        // Must be a multiple of 16 to keep RSP aligned before CALL.
+        int frameSize = roundUp16(totalSlots * 8 + 64);
+
+        // --- Prologue ---
         out.append(f.name).append(":\n");
         out.append("    push    rbp\n");
         out.append("    mov     rbp, rsp\n");
-        out.append("    sub     rsp, 32\n\n");   // 32-byte shadow space, 16-byte aligned
+        out.append("    sub     rsp, ").append(frameSize).append("\n\n");
 
+        // Spill register parameters into their frame slots
+        String[] paramRegs = { "rcx", "rdx", "r8", "r9" };
+        int regIdx = 0;
+        for (AST.ParamDecl p : f.params) {
+            if (p.varargs || p.name == null || regIdx >= 4) { regIdx++; continue; }
+            int off = varOffsets.get(p.name);
+            out.append("    mov     [rbp").append(off).append("], ")
+               .append(paramRegs[regIdx]).append('\n');
+            regIdx++;
+        }
+        if (!f.params.isEmpty()) out.append('\n');
+
+        // --- Body ---
         for (AST.Stmt stmt : f.body.stmts)
             genStmt(stmt, out);
 
-        // Common function exit — may be jumped to by return statements.
+        // --- Epilogue ---
+        // All return statements jump here so epilogue code appears only once.
         out.append(".exit:\n");
-        out.append("    add     rsp, 32\n");
+        out.append("    add     rsp, ").append(frameSize).append('\n');
         out.append("    pop     rbp\n");
         out.append("    ret\n\n");
     }
 
-    // -------------------------------------------------------------------------
-    // Statements
-    // -------------------------------------------------------------------------
+    /**
+     * Recursively scan a compound statement and assign rbp offsets to every
+     * DeclStmt found.  startSlot is the next free slot number on entry.
+     */
+    private void collectLocals(AST.CompoundStmt body, int startSlot) {
+        int slot = startSlot;
+        for (AST.Stmt s : body.stmts) {
+            if (s instanceof AST.DeclStmt) {
+                AST.DeclStmt d = (AST.DeclStmt) s;
+                if (!varOffsets.containsKey(d.name)) {
+                    varOffsets.put(d.name, -8 * slot);
+                    varTypes.put(d.name, d.type);
+                    slot++;
+                }
+            }
+            // Recurse into nested blocks (if/while bodies that are CompoundStmts)
+            else if (s instanceof AST.IfStmt) {
+                AST.IfStmt is = (AST.IfStmt) s;
+                if (is.thenBranch instanceof AST.CompoundStmt)
+                    collectLocals((AST.CompoundStmt) is.thenBranch, slot);
+                if (is.elseBranch instanceof AST.CompoundStmt)
+                    collectLocals((AST.CompoundStmt) is.elseBranch, slot);
+            } else if (s instanceof AST.WhileStmt) {
+                AST.WhileStmt ws = (AST.WhileStmt) s;
+                if (ws.body instanceof AST.CompoundStmt)
+                    collectLocals((AST.CompoundStmt) ws.body, slot);
+            }
+        }
+    }
+
+    // ── Statement generation ──────────────────────────────────────────────
 
     private void genStmt(AST.Stmt stmt, StringBuilder out) {
-        if (stmt instanceof AST.ReturnStmt) {
+
+        if (stmt instanceof AST.DeclStmt) {
+            // Declaration only — space was already reserved in the prologue.
+            // No code needed unless there is an initialiser (not supported yet).
+
+        } else if (stmt instanceof AST.AssignStmt) {
+            AST.AssignStmt a = (AST.AssignStmt) stmt;
+            genExpr(a.rhs, out);                          // result in RAX
+            storeVar(a.lhs, out);
+
+        } else if (stmt instanceof AST.ReturnStmt) {
             AST.Expr val = ((AST.ReturnStmt) stmt).value;
-            if (val == null) {
+            if (val == null)
                 out.append("    xor     eax, eax\n");
-            } else {
+            else
                 genExprIntoEax(val, out);
-            }
             out.append("    jmp     .exit\n");
+
         } else if (stmt instanceof AST.ExprStmt) {
             genExpr(((AST.ExprStmt) stmt).expr, out);
+
+        } else if (stmt instanceof AST.IfStmt) {
+            genIf((AST.IfStmt) stmt, out);
+
+        } else if (stmt instanceof AST.WhileStmt) {
+            genWhile((AST.WhileStmt) stmt, out);
+
+        } else if (stmt instanceof AST.CompoundStmt) {
+            for (AST.Stmt s : ((AST.CompoundStmt) stmt).stmts)
+                genStmt(s, out);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Expressions
-    // -------------------------------------------------------------------------
+    /**
+     * if (cond) thenBranch  [else elseBranch]
+     *
+     * Generated structure:
+     *   <evaluate cond> → RAX
+     *   test rax, rax
+     *   jz   .if_N_else    ; jump past then-branch if cond is zero (false)
+     *   <then body>
+     *   jmp  .if_N_end     ; skip else-branch
+     *  .if_N_else:
+     *   <else body>        ; only if else-branch present
+     *  .if_N_end:
+     */
+    private void genIf(AST.IfStmt stmt, StringBuilder out) {
+        int id = labelCount++;
+        String elseLabel = ".if_" + id + "_else";
+        String endLabel  = ".if_" + id + "_end";
 
+        genExpr(stmt.cond, out);
+        out.append("    test    rax, rax\n");
+        out.append("    jz      ").append(elseLabel).append('\n');
+
+        genStmt(stmt.thenBranch, out);
+        out.append("    jmp     ").append(endLabel).append('\n');
+
+        out.append(elseLabel).append(":\n");
+        if (stmt.elseBranch != null) genStmt(stmt.elseBranch, out);
+        out.append(endLabel).append(":\n");
+    }
+
+    /**
+     * while (cond) body
+     *
+     *  .while_N_start:
+     *   <evaluate cond> → RAX
+     *   test rax, rax
+     *   jz   .while_N_end
+     *   <body>
+     *   jmp  .while_N_start
+     *  .while_N_end:
+     */
+    private void genWhile(AST.WhileStmt stmt, StringBuilder out) {
+        int id = labelCount++;
+        String startLabel = ".while_" + id + "_start";
+        String endLabel   = ".while_" + id + "_end";
+
+        out.append(startLabel).append(":\n");
+        genExpr(stmt.cond, out);
+        out.append("    test    rax, rax\n");
+        out.append("    jz      ").append(endLabel).append('\n');
+
+        genStmt(stmt.body, out);
+        out.append("    jmp     ").append(startLabel).append('\n');
+        out.append(endLabel).append(":\n");
+    }
+
+    // ── Expression generation ─────────────────────────────────────────────
+
+    /**
+     * Generate code that evaluates the expression and leaves the result in RAX.
+     * This is the main expression dispatch.
+     */
     private void genExpr(AST.Expr expr, StringBuilder out) {
-        if (expr instanceof AST.CallExpr) {
+
+        if (expr instanceof AST.IntLit) {
+            long v = ((AST.IntLit) expr).value;
+            if (v == 0) out.append("    xor     rax, rax\n");
+            else        out.append("    mov     rax, ").append(v).append('\n');
+
+        } else if (expr instanceof AST.StringLit) {
+            int idx = internString(((AST.StringLit) expr).value);
+            out.append("    lea     rax, [_str").append(idx).append("]\n");
+
+        } else if (expr instanceof AST.IdentExpr) {
+            loadVar(((AST.IdentExpr) expr).name, out);
+
+        } else if (expr instanceof AST.UnaryExpr) {
+            genUnary((AST.UnaryExpr) expr, out);
+
+        } else if (expr instanceof AST.BinaryExpr) {
+            genBinary((AST.BinaryExpr) expr, out);
+
+        } else if (expr instanceof AST.IndexExpr) {
+            genIndex((AST.IndexExpr) expr, out);
+
+        } else if (expr instanceof AST.CallExpr) {
             genCall((AST.CallExpr) expr, out);
-        } else if (expr instanceof AST.IntLit) {
-            genExprIntoEax(expr, out);
         }
-        // Result (if any) left in rax/eax.
     }
 
+    /**
+     * Convenience wrapper: evaluate expr into EAX (the 32-bit alias of RAX).
+     * Used for return values where the C type is "int".
+     */
+    private void genExprIntoEax(AST.Expr expr, StringBuilder out) {
+        if (expr instanceof AST.IntLit) {
+            long v = ((AST.IntLit) expr).value;
+            if (v == 0) out.append("    xor     eax, eax\n");
+            else        out.append("    mov     eax, ").append((int) v).append('\n');
+        } else {
+            genExpr(expr, out); // result already in rax/eax
+        }
+    }
+
+    // ── Unary expressions ─────────────────────────────────────────────────
+
+    private void genUnary(AST.UnaryExpr expr, StringBuilder out) {
+        switch (expr.op) {
+            case "-":
+                genExpr(expr.operand, out);
+                out.append("    neg     rax\n");
+                break;
+
+            case "!":
+                genExpr(expr.operand, out);
+                // !x → 1 if x==0, else 0
+                out.append("    test    rax, rax\n");
+                out.append("    sete    al\n");
+                out.append("    movzx   rax, al\n");
+                break;
+
+            case "&":
+                // Address-of: operand must be a named variable
+                if (expr.operand instanceof AST.IdentExpr) {
+                    String name = ((AST.IdentExpr) expr.operand).name;
+                    addrOfVar(name, "rax", out);
+                } else {
+                    throw new RuntimeException("& requires a variable operand");
+                }
+                break;
+
+            case "*":
+                // Pointer dereference: load address, then load qword at it
+                genExpr(expr.operand, out);
+                out.append("    mov     rax, [rax]\n");
+                break;
+        }
+    }
+
+    // ── Binary expressions ────────────────────────────────────────────────
+
+    /**
+     * Generate a binary expression.
+     *
+     * Strategy: evaluate left → push RAX; evaluate right → RAX;
+     * pop left into RCX; combine RCX op RAX → RAX.
+     *
+     * The push/pop must be balanced before any CALL — this holds because
+     * argument expressions in stdio.c are all simple (no nested calls).
+     */
+    private void genBinary(AST.BinaryExpr expr, StringBuilder out) {
+        genExpr(expr.left, out);    // left  → RAX
+        out.append("    push    rax\n");
+        genExpr(expr.right, out);   // right → RAX
+        out.append("    pop     rcx\n");  // rcx = left, rax = right
+
+        switch (expr.op) {
+            case "+":
+                out.append("    add     rax, rcx\n");       // rax = left + right
+                break;
+            case "-":
+                // result = left - right = rcx - rax
+                out.append("    sub     rcx, rax\n");
+                out.append("    mov     rax, rcx\n");
+                break;
+            case "*":
+                out.append("    imul    rax, rcx\n");
+                break;
+            case "/":
+                // After pop: rcx = left, rax = right.
+                // idiv divides rdx:rax by the operand; quotient → rax, remainder → rdx.
+                out.append("    xchg    rax, rcx\n");   // rax = left, rcx = right
+                out.append("    cqo\n");               // sign-extend rax into rdx:rax
+                out.append("    idiv    rcx\n");       // rax = left / right
+                break;
+            case "%":
+                out.append("    xchg    rax, rcx\n");   // rax = left, rcx = right
+                out.append("    cqo\n");
+                out.append("    idiv    rcx\n");       // rdx = left % right
+                out.append("    mov     rax, rdx\n");  // result in rax
+                break;
+
+            // Comparison operators all use CMP + SETcc → 0 or 1 in AL/RAX
+            case "==":
+                out.append("    cmp     rcx, rax\n");
+                out.append("    sete    al\n");
+                out.append("    movzx   rax, al\n");
+                break;
+            case "!=":
+                out.append("    cmp     rcx, rax\n");
+                out.append("    setne   al\n");
+                out.append("    movzx   rax, al\n");
+                break;
+            case "<":
+                out.append("    cmp     rcx, rax\n");
+                out.append("    setl    al\n");
+                out.append("    movzx   rax, al\n");
+                break;
+            case ">":
+                out.append("    cmp     rcx, rax\n");
+                out.append("    setg    al\n");
+                out.append("    movzx   rax, al\n");
+                break;
+            case "<=":
+                out.append("    cmp     rcx, rax\n");
+                out.append("    setle   al\n");
+                out.append("    movzx   rax, al\n");
+                break;
+            case ">=":
+                out.append("    cmp     rcx, rax\n");
+                out.append("    setge   al\n");
+                out.append("    movzx   rax, al\n");
+                break;
+        }
+    }
+
+    // ── Array indexing ────────────────────────────────────────────────────
+
+    /**
+     * arr[idx] — compute address arr+idx and load one byte (char array)
+     * or one qword (everything else).
+     * For now: always load byte and zero-extend, since jcc only uses [] on char*.
+     */
+    private void genIndex(AST.IndexExpr expr, StringBuilder out) {
+        genExpr(expr.array, out);   // base pointer → RAX
+        out.append("    push    rax\n");
+        genExpr(expr.index, out);   // index → RAX
+        out.append("    pop     rcx\n");  // rcx = base, rax = index
+        // Load byte at [base + index] and zero-extend to 64 bits
+        out.append("    movzx   rax, byte [rcx + rax]\n");
+    }
+
+    // ── Function calls ────────────────────────────────────────────────────
+
+    /**
+     * Set up arguments and call a function.
+     *
+     * Args 0-3 go into RCX/RDX/R8/R9.
+     * Arg 4+ go on the stack at [RSP+32], [RSP+40], …
+     * The 32-byte shadow space and the extra stack arg slots were allocated
+     * in the function prologue, so we just write to [RSP+offset].
+     */
     private void genCall(AST.CallExpr call, StringBuilder out) {
         if (!defined.contains(call.callee))
             externs.add(call.callee);
 
-        // Load arguments (up to 4 register args; stack args not yet supported).
-        for (int i = 0; i < call.args.size() && i < ARG_REGS.length; i++)
-            loadArg(call.args.get(i), ARG_REGS[i], out);
-
+        // Load each argument into the appropriate place
+        for (int i = 0; i < call.args.size(); i++) {
+            AST.Expr arg = call.args.get(i);
+            if (i < ARG_REGS.length) {
+                loadArgIntoReg(arg, ARG_REGS[i], out);
+            } else {
+                // 5th argument and beyond: write to [rsp + 32 + (i-4)*8]
+                int stackOff = 32 + (i - 4) * 8;
+                genExpr(arg, out);  // value → RAX
+                out.append("    mov     qword [rsp+").append(stackOff)
+                   .append("], rax\n");
+            }
+        }
         out.append("    call    ").append(call.callee).append('\n');
     }
 
-    private void loadArg(AST.Expr arg, String reg, StringBuilder out) {
+    /**
+     * Load one call argument into a register.
+     * Special-cases address-of (&var) to emit LEA instead of a value load,
+     * and string/int literals for direct immediate encoding.
+     */
+    private void loadArgIntoReg(AST.Expr arg, String reg, StringBuilder out) {
+        // &var — load the address of a local or global variable
+        if (arg instanceof AST.UnaryExpr && "&".equals(((AST.UnaryExpr) arg).op)) {
+            AST.Expr inner = ((AST.UnaryExpr) arg).operand;
+            if (inner instanceof AST.IdentExpr) {
+                addrOfVar(((AST.IdentExpr) inner).name, reg, out);
+                return;
+            }
+        }
+        // String literal — load its .data address with LEA
         if (arg instanceof AST.StringLit) {
             int idx = internString(((AST.StringLit) arg).value);
             out.append("    lea     ").append(reg).append(", [_str").append(idx).append("]\n");
-        } else if (arg instanceof AST.IntLit) {
-            long val = ((AST.IntLit) arg).value;
-            if (val == 0) out.append("    xor     ").append(reg).append(", ").append(reg).append('\n');
-            else          out.append("    mov     ").append(reg).append(", ").append(val).append('\n');
-        } else if (arg instanceof AST.IdentExpr) {
-            out.append("    ; TODO: load variable '").append(((AST.IdentExpr) arg).name).append("'\n");
+            return;
+        }
+        // Integer literal — use MOV immediate (or XOR for 0)
+        if (arg instanceof AST.IntLit) {
+            long v = ((AST.IntLit) arg).value;
+            if (v == 0) out.append("    xor     ").append(reg).append(", ").append(reg).append('\n');
+            else        out.append("    mov     ").append(reg).append(", ").append(v).append('\n');
+            return;
+        }
+        // General expression: evaluate into RAX, then move to target register
+        genExpr(arg, out);
+        if (!"rax".equals(reg))
+            out.append("    mov     ").append(reg).append(", rax\n");
+    }
+
+    // ── Variable access helpers ───────────────────────────────────────────
+
+    /**
+     * Emit a load of variable 'name' into RAX.
+     * Checks local frame first, then global .bss, then treats as extern constant.
+     */
+    private void loadVar(String name, StringBuilder out) {
+        Integer off = varOffsets.get(name);
+        if (off != null) {
+            // Local variable or parameter: load qword from frame
+            out.append("    mov     rax, [rbp").append(off).append("]\n");
+        } else if (globalVarNames.contains(name)) {
+            // Global variable: RIP-relative load from .bss
+            out.append("    mov     rax, [rel ").append(name).append("]\n");
         } else {
-            genExpr(arg, out);
-            if (!"rcx".equals(reg))
-                out.append("    mov     ").append(reg).append(", rax\n");
+            // Unknown identifier — should have been caught by the parser;
+            // emit a comment so the assembler catches it clearly.
+            out.append("    ; ERROR: unknown variable '").append(name).append("'\n");
         }
     }
 
-    private void genExprIntoEax(AST.Expr expr, StringBuilder out) {
-        if (expr instanceof AST.IntLit) {
-            long val = ((AST.IntLit) expr).value;
-            if (val == 0) out.append("    xor     eax, eax\n");
-            else          out.append("    mov     eax, ").append(val).append('\n');
+    /**
+     * Store RAX into variable 'name' (local or global).
+     */
+    private void storeVar(String name, StringBuilder out) {
+        Integer off = varOffsets.get(name);
+        if (off != null) {
+            out.append("    mov     [rbp").append(off).append("], rax\n");
+        } else if (globalVarNames.contains(name)) {
+            out.append("    mov     [rel ").append(name).append("], rax\n");
         } else {
-            genExpr(expr, out);
+            out.append("    ; ERROR: unknown variable '").append(name).append("'\n");
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
+    /**
+     * Load the ADDRESS of variable 'name' into a named register using LEA.
+     * Used for address-of (&var) in argument passing.
+     */
+    private void addrOfVar(String name, String reg, StringBuilder out) {
+        Integer off = varOffsets.get(name);
+        if (off != null) {
+            out.append("    lea     ").append(reg).append(", [rbp").append(off).append("]\n");
+        } else if (globalVarNames.contains(name)) {
+            out.append("    lea     ").append(reg).append(", [rel ").append(name).append("]\n");
+        } else {
+            out.append("    ; ERROR: address-of unknown variable '").append(name).append("'\n");
+        }
+    }
 
+    // ── Utility ───────────────────────────────────────────────────────────
+
+    /** Return the index of s in the string table, interning it if needed. */
     private int internString(String s) {
         for (int i = 0; i < strings.size(); i++)
             if (strings.get(i).equals(s)) return i;
@@ -162,13 +631,19 @@ public class CodeGen {
         return strings.size() - 1;
     }
 
+    /** Convert a Java string to a comma-separated list of byte values for NASM db. */
     private String toBytes(String s) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
             if (i > 0) sb.append(", ");
             sb.append((int) s.charAt(i));
         }
-        sb.append(", 0"); // null terminator
+        sb.append(", 0");  // null terminator
         return sb.toString();
+    }
+
+    /** Round n up to the next multiple of 16 (for stack alignment). */
+    private static int roundUp16(int n) {
+        return (n + 15) & ~15;
     }
 }
