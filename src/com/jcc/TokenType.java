@@ -1,0 +1,10 @@
+package com.jcc;
+
+public enum TokenType {
+    INT_LITERAL, STRING_LITERAL,
+    IDENTIFIER,
+    KW_INT, KW_RETURN, KW_VOID, KW_CHAR,
+    LPAREN, RPAREN, LBRACE, RBRACE, SEMI, COMMA, STAR, ELLIPSIS,
+    ASSIGN,
+    EOF
+}

@@ -1,0 +1,196 @@
+# jcc — Java C Compiler, version 2
+
+A minimal K&R C compiler written in Java 1.8, targeting 64-bit Windows.  
+Compiles a small but growing subset of C to native x86-64 executables.
+
+**What changed from v1:** `printf`, `puts`, and `putchar` are now implemented
+natively in `stdlib/src/stdio.c` using the Windows `kernel32.dll` API
+(`GetStdHandle` + `WriteFile`) instead of being resolved from the Windows
+UCRT (`ucrt.dll`).
+
+---
+
+## Prerequisites
+
+| Tool | Location | Purpose |
+|------|----------|---------|
+| JDK 1.8 | on `PATH` | compile and run jcc itself |
+| NASM | `C:\Apps\mingw64\bin\nasm.exe` | assemble generated `.asm` |
+| GCC (mingw64) | `C:\Apps\mingw64\bin\gcc.exe` | compile stdlib + link |
+
+Add `C:\Apps\mingw64\bin` to your system `PATH` so these tools are reachable from any terminal.
+
+---
+
+## Quick start
+
+```bat
+:: 1. Build the compiler (only needed once, or after editing Java sources)
+build.bat
+
+:: 2. Compile a C file
+jcc.bat hello.c
+
+:: 3. Run the result
+hello.exe
+```
+
+To specify an output name:
+
+```bat
+jcc.bat hello.c -o myapp.exe
+```
+
+The first compile also bootstraps `stdlib/src/stdio.obj` automatically.
+
+---
+
+## Compilation pipeline
+
+```
+hello.c
+  │
+  ▼  Preprocessor.java
+  │  • Expands #include <stdio.h> to stdlib/include/stdio.h
+  │  • Strips all other # directives
+  │
+  ▼  Lexer.java
+  │  • Produces a flat token stream
+  │
+  ▼  Parser.java
+  │  • Recursive-descent → AST (ast/AST.java)
+  │
+  ▼  CodeGen.java
+  │  • Walks AST → x86-64 NASM assembly
+  │  • Windows x64 ABI: args in RCX/RDX/R8/R9, 32-byte shadow space
+  │
+  ▼  nasm.exe -f win64
+  │  hello.asm → hello.obj
+  │
+  ▼  gcc.exe -c  (bootstrap, runs once / when stdio.c changes)
+  │  stdlib/src/stdio.c → stdlib/src/stdio.obj
+  │
+  ▼  gcc.exe (linker only)
+     hello.obj + stdio.obj → hello.exe
+     GNU ld resolves 'printf' from stdio.obj (strong symbol) before
+     it reaches the ucrt import library — UCRT's printf is never used
+```
+
+---
+
+## Native stdio implementation
+
+`stdlib/src/stdio.c` is compiled with gcc (as a one-time bootstrap step) and
+linked with every program jcc produces.  It depends only on `kernel32.dll`:
+
+```
+GetStdHandle(STD_OUTPUT_HANDLE)   →  obtain stdout handle (cached)
+WriteFile(handle, buf, len, ...)  →  all output goes through this
+```
+
+### Supported printf format specifiers
+
+| Specifier | Meaning |
+|-----------|---------|
+| `%%` | literal `%` |
+| `%c` | `char` (promoted `int`) |
+| `%s` | `const char *` (prints `(null)` for NULL) |
+| `%d` / `%i` | signed `int`, decimal |
+| `%u` | unsigned `int`, decimal |
+| `%x` / `%X` | unsigned `int`, hex lower/upper |
+| `%p` | pointer, hex lowercase |
+
+Future specifiers (`%ld`, `%lld`, `%f`, field widths, precision) are added as
+the compiler and stdlib grow.
+
+### Roadmap to self-hosting stdio
+
+The long-term goal is for jcc to compile `stdio.c` itself, removing the gcc
+bootstrap step entirely.  That requires jcc to support:
+
+1. Local variables and stack allocation
+2. Pointer arithmetic and dereference
+3. `va_list` / `va_arg` (or a Windows x64 ABI-specific equivalent)
+4. Conditional statements and loops
+5. Static variables
+
+---
+
+## Supported C features
+
+**Types**
+- `int`, `char`, `void`
+- Pointer types (`char *`, `int *`, etc.)
+- `const`, `unsigned`, `signed` qualifiers (parsed and ignored)
+
+**Declarations**
+- Function definitions: `int foo(int x) { ... }`
+- Function forward declarations: `int printf(const char *fmt, ...);`
+- Variadic parameter lists (`...`)
+
+**Statements**
+- Expression statements: `foo();`
+- `return expr;` and bare `return;`
+- Compound statements: `{ ... }`
+
+**Expressions**
+- Function calls: `printf("hello")`
+- String literals (with `\n \t \r \\ \" \0` escapes)
+- Integer literals
+- Identifier references
+
+**Preprocessor**
+- `#include <header>` — expanded from `stdlib/include/` if present, silently skipped otherwise
+- All other `#` directives silently dropped
+
+---
+
+## Project structure
+
+```
+jcc_v2/
+  build.bat                   compile Java sources → out/
+  jcc.bat                     run the compiler
+  src/com/jcc/
+    Main.java                 entry point; orchestrates all stages + stdlib bootstrap
+    Preprocessor.java         #include expansion and directive stripping
+    Lexer.java                character stream → token stream
+    Token.java                token value + source line
+    TokenType.java            token type enum
+    Parser.java               recursive-descent parser → AST
+    CodeGen.java              AST → x86-64 NASM assembly
+    ast/
+      AST.java                all AST node types (inner static classes)
+  stdlib/
+    include/stdio.h           C header declaring printf, puts, putchar
+    src/stdio.c               native printf/puts/putchar (kernel32 only)
+    src/stdio.obj             compiled stdlib object (generated on first run)
+  out/                        compiled .class files (generated by build.bat)
+```
+
+---
+
+## What changed from v1
+
+| | v1 | v2 |
+|--|----|----|
+| `printf` source | `ucrt.dll` (Windows CRT) | `stdlib/src/stdio.c` (kernel32 only) |
+| `puts` / `putchar` | `ucrt.dll` | `stdlib/src/stdio.c` |
+| Link step | `gcc user.obj` | `gcc user.obj stdio.obj` |
+| `stdio.c` | comment / plan only | full implementation |
+| `Main.java` | link single obj | compile stdio.c if stale, then link both |
+| DLL imports | `printf` from ucrt | `GetStdHandle`, `WriteFile` from kernel32 |
+
+---
+
+## Known limitations
+
+- No local variables or stack allocation
+- No arithmetic or comparison operators
+- No control flow (`if`, `while`, `for`)
+- No struct, union, or typedef
+- Only up to 4 function arguments (register args only; no stack spill)
+- No `#define` or macro expansion
+- Single translation unit only (no multi-file compilation)
+- `printf` bootstrap compilation uses gcc; self-hosted stdlib compilation is
+  a future milestone
